@@ -1,5 +1,4 @@
 import telebot
-from telebot import types
 import psycopg2
 from config import *
 
@@ -23,6 +22,7 @@ def create_table():
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
         is_completed BOOLEAN DEFAULT FALSE,
+        is_archived BOOLEAN DEFAULT FALSE,
         user_id BIGINT NOT NULL
     )
     """)
@@ -41,11 +41,12 @@ def start_message(message):
 def help_message(message):
     help_text = (
         "/start — начать работу\n"
-        "/help — показать список команд\n"
         "/add <название> — добавить задачу\n"
         "/list — показать список задач\n"
+#        "/archive — показать удалённый список задач\n"        
+        "/complete <номер> — отметить задачу как выполненную\n"
         "/delete <номер> — удалить задачу\n"
-        "/complete <номер> — отметить задачу как выполненную"
+        "/help — показать список команд\n"
     )
     bot.reply_to(message, help_text)
 
@@ -76,8 +77,11 @@ def add_task(message):
 @bot.message_handler(commands=['list'])
 def list_tasks(message):
     user_id = message.from_user.id
+    # Добавляем фильтрацию по is_archived=FALSE
     cur.execute(
-        "SELECT id, name, is_completed FROM tasks WHERE user_id = %s ORDER BY id",
+        "SELECT id, name, is_completed FROM tasks "
+        "WHERE user_id = %s AND is_archived = FALSE "
+        "ORDER BY id",
         (user_id,)
     )
     rows = cur.fetchall()
@@ -88,38 +92,61 @@ def list_tasks(message):
     for row in rows:
         task_id, name, is_completed = row
         status = "✅" if is_completed else "❌"
-        task_list.append(f"№{task_id}: {name} {status}")
+        task_list.append(f"- {name}, id: {task_id} {status}")
     bot.reply_to(message, "Ваши задачи:\n" + "\n".join(task_list))
 
 
-# Обработчик /delete
+# Обработчик /archive
+@bot.message_handler(commands=['archive'])
+def archive_tasks(message):
+    user_id = message.from_user.id
+
+    cur.execute(
+        "SELECT id, name, is_completed FROM tasks "
+        "WHERE user_id = %s AND is_archived = TRUE "
+        "ORDER BY id",
+        (user_id,)
+    )
+    rows = cur.fetchall()
+    if not rows:
+        bot.reply_to(message, "Ваш список задач пуст.")
+        return
+    task_list = []
+    for row in rows:
+        task_id, name, is_completed = row
+        status = "✅" if is_completed else "❌"
+        task_list.append(f"- {name}, id: {task_id} {status}")
+    bot.reply_to(message, "Ваши архивные задачи:\n" + "\n".join(task_list))
+
+
+# Обработчик /delete, но он не удаляет, а меняет False на True
 @bot.message_handler(commands=['delete'])
 def delete_task(message):
     user_id = message.from_user.id
     args = message.text.split()
     if len(args) != 2:
-        bot.reply_to(message, "Неверный формат. Пример: /delete 1")
+        bot.reply_to(message, "Неверный формат. Пример: /delete 68")
         return
     try:
         task_id = int(args[1])
     except ValueError:
-        bot.reply_to(message, "Номер задачи должен быть числом.")
+        bot.reply_to(message, "Номер id должен быть числом.")
         return
     try:
         cur.execute(
-            "DELETE FROM tasks WHERE id = %s AND user_id = %s RETURNING id",
+            "UPDATE tasks SET is_archived = TRUE WHERE id = %s AND user_id = %s RETURNING id",
             (task_id, user_id)
         )
-        deleted = cur.fetchone()
-        if deleted:
+        updated = cur.fetchone()
+        if updated:
             conn.commit()
-            bot.reply_to(message, f"Задача {task_id} удалена.")
+            bot.reply_to(message, f"Задача под номером id: {task_id} удалена.")
         else:
             conn.rollback()
-            bot.reply_to(message, "Такой задачи не существует или она не ваша.")
+            bot.reply_to(message, "Такая задача не найдена или не ваша.")
     except Exception as e:
         conn.rollback()
-        bot.reply_to(message, "Ошибка при удалении задачи.")
+        bot.reply_to(message, "Ошибка при обновлении статуса.")
 
 
 # Обработчик /complete
@@ -128,7 +155,7 @@ def complete_task(message):
     user_id = message.from_user.id
     args = message.text.split()
     if len(args) != 2:
-        bot.reply_to(message, "Неверный формат. Пример: /complete 1")
+        bot.reply_to(message, "Неверный формат. Пример: /complete 68")
         return
     try:
         task_id = int(args[1])
@@ -143,7 +170,7 @@ def complete_task(message):
         updated = cur.fetchone()
         if updated:
             conn.commit()
-            bot.reply_to(message, f"Задача {task_id} отмечена как выполненная.")
+            bot.reply_to(message, f"Задача под номером id: {task_id} отмечена как выполненная.")
         else:
             conn.rollback()
             bot.reply_to(message, "Такая задача не найдена или не ваша.")
@@ -159,4 +186,5 @@ def handle_unknown(message):
 
 
 # Запуск бота
+print("Бот запущен...")
 bot.polling(none_stop=True)
