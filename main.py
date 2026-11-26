@@ -1,190 +1,282 @@
-import telebot
+import logging
+import time
 import psycopg2
-from config import *
+import telebot
+from contextlib import contextmanager
+
+from config import (
+    BOT_TOKEN,
+    DB_HOST,
+    DB_PORT,
+    DB_NAME,
+    DB_USER,
+    DB_PASSWORD,
+)
 
 
-# Настройка бота
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Подключение к PostgreSQL
-conn = psycopg2.connect(
-    host=HOST,
-    database=DB,
-    user=USER,
-    password=PAS
-)
-cur = conn.cursor()
 
-# Создание таблицы
-def create_table():
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tasks (
-        id SERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        is_completed BOOLEAN DEFAULT FALSE,
-        is_archived BOOLEAN DEFAULT FALSE,
-        user_id BIGINT NOT NULL
+@contextmanager
+def db():
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
     )
-    """)
-    conn.commit()
-create_table()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-# Обработчик /start
-@bot.message_handler(commands=['start'])
+def create_table():
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    is_completed BOOLEAN DEFAULT FALSE,
+                    is_archived BOOLEAN DEFAULT FALSE,
+                    user_id BIGINT NOT NULL
+                )
+            """)
+
+
+@bot.message_handler(commands=["start"])
 def start_message(message):
-    bot.reply_to(message, "Привет! Я бот для управления списком задач. Используйте /help для списка команд.")
+    bot.reply_to(
+        message,
+        "Привет! Я бот для управления списком задач. Используйте /help для списка команд.",
+    )
 
 
-# Обработчик /help
-@bot.message_handler(commands=['help'])
+@bot.message_handler(commands=["help"])
 def help_message(message):
     help_text = (
         "/start — начать работу\n"
         "/add <название> — добавить задачу\n"
-        "/list — показать список задач\n"
-#        "/archive — показать удалённый список задач\n"        
-        "/complete <номер> — отметить задачу как выполненную\n"
-        "/delete <номер> — удалить задачу\n"
+        "/list — показать активные задачи\n"
+        "/archive — показать архивные задачи\n"
+        "/complete <id> — отметить задачу выполненной\n"
+        "/delete <id> — переместить задачу в архив\n"
         "/help — показать список команд\n"
     )
     bot.reply_to(message, help_text)
 
 
-# Обработчик /add
-@bot.message_handler(commands=['add'])
+@bot.message_handler(commands=["add"])
 def add_task(message):
     user_id = message.from_user.id
-    args = message.text.split()
-    if len(args) < 2:
+    args = message.text.split(maxsplit=1)
+
+    if len(args) < 2 or not args[1].strip():
         bot.reply_to(message, "Укажите название задачи. Пример: /add Купить молоко")
         return
-    name = ' '.join(args[1:])
+
+    name = args[1].strip()
+    if len(name) > 500:
+        bot.reply_to(message, "Слишком длинное название задачи. Максимум 500 символов.")
+        return
+
     try:
-        cur.execute(
-            "INSERT INTO tasks (name, user_id) VALUES (%s, %s) RETURNING id",
-            (name, user_id)
-        )
-        task_id = cur.fetchone()[0]
-        conn.commit()
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO tasks (name, user_id) VALUES (%s, %s) RETURNING id",
+                    (name, user_id),
+                )
+                task_id = cur.fetchone()[0]
+
         bot.reply_to(message, f"Задача '{name}' добавлена. ID: {task_id}")
-    except Exception as e:
-        conn.rollback()
+    except Exception:
+        logging.exception("Ошибка при добавлении задачи")
         bot.reply_to(message, "Ошибка при добавлении задачи. Попробуйте позже.")
 
 
-# Обработчик /list
-@bot.message_handler(commands=['list'])
+@bot.message_handler(commands=["list"])
 def list_tasks(message):
     user_id = message.from_user.id
-    # Добавляем фильтрацию по is_archived=FALSE
-    cur.execute(
-        "SELECT id, name, is_completed FROM tasks "
-        "WHERE user_id = %s AND is_archived = FALSE "
-        "ORDER BY id",
-        (user_id,)
-    )
-    rows = cur.fetchall()
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, name, is_completed
+                    FROM tasks
+                    WHERE user_id = %s AND is_archived = FALSE
+                    ORDER BY id
+                    """,
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+    except Exception:
+        logging.exception("Ошибка при получении списка задач")
+        bot.reply_to(message, "Ошибка при получении списка задач.")
+        return
+
     if not rows:
         bot.reply_to(message, "Ваш список задач пуст.")
         return
+
     task_list = []
-    for row in rows:
-        task_id, name, is_completed = row
-        status = "✅" if is_completed else "❌"
-        task_list.append(f"- {name}, id: {task_id} {status}")
+    for task_id, name, is_completed in rows:
+        status = "✅" if is_completed else "⏳"
+        task_list.append(f"- id {task_id}: {name} {status}")
+
     bot.reply_to(message, "Ваши задачи:\n" + "\n".join(task_list))
 
 
-# Обработчик /archive
-@bot.message_handler(commands=['archive'])
+@bot.message_handler(commands=["archive"])
 def archive_tasks(message):
     user_id = message.from_user.id
 
-    cur.execute(
-        "SELECT id, name, is_completed FROM tasks "
-        "WHERE user_id = %s AND is_archived = TRUE "
-        "ORDER BY id",
-        (user_id,)
-    )
-    rows = cur.fetchall()
-    if not rows:
-        bot.reply_to(message, "Ваш список задач пуст.")
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, name, is_completed
+                    FROM tasks
+                    WHERE user_id = %s AND is_archived = TRUE
+                    ORDER BY id
+                    """,
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+    except Exception:
+        logging.exception("Ошибка при получении архива")
+        bot.reply_to(message, "Ошибка при получении архива.")
         return
+
+    if not rows:
+        bot.reply_to(message, "Ваш архив пуст.")
+        return
+
     task_list = []
-    for row in rows:
-        task_id, name, is_completed = row
-        status = "✅" if is_completed else "❌"
-        task_list.append(f"- {name}, id: {task_id} {status}")
+    for task_id, name, is_completed in rows:
+        status = "✅" if is_completed else "⏳"
+        task_list.append(f"- id {task_id}: {name} {status}")
+
     bot.reply_to(message, "Ваши архивные задачи:\n" + "\n".join(task_list))
 
 
-# Обработчик /delete, но он не удаляет, а меняет False на True
-@bot.message_handler(commands=['delete'])
-def delete_task(message):
-    user_id = message.from_user.id
+def get_task_id(message):
     args = message.text.split()
     if len(args) != 2:
         bot.reply_to(message, "Неверный формат. Пример: /delete 68")
-        return
+        return None
+
     try:
-        task_id = int(args[1])
+        return int(args[1])
     except ValueError:
-        bot.reply_to(message, "Номер id должен быть числом.")
+        bot.reply_to(message, "ID задачи должен быть числом.")
+        return None
+
+
+@bot.message_handler(commands=["delete"])
+def delete_task(message):
+    user_id = message.from_user.id
+    task_id = get_task_id(message)
+    if task_id is None:
         return
+
     try:
-        cur.execute(
-            "UPDATE tasks SET is_archived = TRUE WHERE id = %s AND user_id = %s RETURNING id",
-            (task_id, user_id)
-        )
-        updated = cur.fetchone()
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE tasks
+                    SET is_archived = TRUE
+                    WHERE id = %s
+                      AND user_id = %s
+                      AND is_archived = FALSE
+                    RETURNING id
+                    """,
+                    (task_id, user_id),
+                )
+                updated = cur.fetchone()
+
         if updated:
-            conn.commit()
-            bot.reply_to(message, f"Задача под номером id: {task_id} удалена.")
+            bot.reply_to(message, f"Задача с id {task_id} перемещена в архив.")
         else:
-            conn.rollback()
-            bot.reply_to(message, "Такая задача не найдена или не ваша.")
-    except Exception as e:
-        conn.rollback()
-        bot.reply_to(message, "Ошибка при обновлении статуса.")
+            bot.reply_to(message, "Активная задача с таким id не найдена.")
+    except Exception:
+        logging.exception("Ошибка при архивировании задачи")
+        bot.reply_to(message, "Ошибка при архивировании задачи.")
 
 
-# Обработчик /complete
-@bot.message_handler(commands=['complete'])
+@bot.message_handler(commands=["complete"])
 def complete_task(message):
     user_id = message.from_user.id
-    args = message.text.split()
-    if len(args) != 2:
-        bot.reply_to(message, "Неверный формат. Пример: /complete 68")
+    task_id = get_task_id(message)
+    if task_id is None:
         return
+
     try:
-        task_id = int(args[1])
-    except ValueError:
-        bot.reply_to(message, "Номер задачи должен быть числом.")
-        return
-    try:
-        cur.execute(
-            "UPDATE tasks SET is_completed = TRUE WHERE id = %s AND user_id = %s RETURNING id",
-            (task_id, user_id)
-        )
-        updated = cur.fetchone()
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE tasks
+                    SET is_completed = TRUE
+                    WHERE id = %s
+                      AND user_id = %s
+                      AND is_archived = FALSE
+                      AND is_completed = FALSE
+                    RETURNING id
+                    """,
+                    (task_id, user_id),
+                )
+                updated = cur.fetchone()
+
         if updated:
-            conn.commit()
-            bot.reply_to(message, f"Задача под номером id: {task_id} отмечена как выполненная.")
+            bot.reply_to(message, f"Задача с id {task_id} отмечена как выполненная.")
         else:
-            conn.rollback()
-            bot.reply_to(message, "Такая задача не найдена или не ваша.")
-    except Exception as e:
-        conn.rollback()
-        bot.reply_to(message, "Ошибка при обновлении статуса.")
+            bot.reply_to(
+                message,
+                "Активная невыполненная задача с таким id не найдена.",
+            )
+    except Exception:
+        logging.exception("Ошибка при выполнении задачи")
+        bot.reply_to(message, "Ошибка при обновлении статуса задачи.")
 
 
-# Обработка неизвестных команд
 @bot.message_handler(func=lambda m: True)
 def handle_unknown(message):
     bot.reply_to(message, "Неизвестная команда. Используйте /help.")
 
 
-# Запуск бота
-print("Бот запущен...")
-bot.polling(none_stop=True)
+
+if __name__ == "__main__":
+    create_table()
+
+    print("Бот запущен...")
+    while True:
+        try:
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=60,
+                long_polling_timeout=60,
+            )
+        except KeyboardInterrupt:
+            logging.info("Остановка по Ctrl+C")
+            break
+        except Exception as e:
+            logging.error(
+                "Критическая ошибка в polling: %s. Перезапуск через 15 секунд...", e
+            )
+            time.sleep(15)

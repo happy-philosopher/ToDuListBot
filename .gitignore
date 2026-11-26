@@ -4,6 +4,7 @@ venv/
 empty/
 temp/
 **/__pycache__/
+.env
+*.pyc
 test*.py
 test*.txt
-config.py
